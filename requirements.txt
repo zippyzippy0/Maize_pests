@@ -3,3 +3,4 @@ numpy
 joblib
 requests
 scikit-learn
+geocoder
