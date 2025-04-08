@@ -4,3 +4,6 @@ joblib
 requests
 scikit-learn
 geocoder
+geopy
+pydeck
+streamlit-lottie
