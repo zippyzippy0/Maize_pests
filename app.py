@@ -1,26 +1,20 @@
 import streamlit as st
-import numpy as np
+import pandas as pd
 import joblib
 import requests
-import pydeck as pdk
-import os
+from sklearn.feature_extraction.text import TfidfVectorizer
 
-# Optional: Set public Mapbox token
-os.environ["MAPBOX_API_KEY"] = "pk.eyJ1IjoibWFwYm94IiwiYSI6ImNpejY4NXVycTA2emYycXBnd3Z6eWl2eWgifQ.-0lBXRQ0tNMa1l8HxI1ERA"
-
-# Load all pest models
-pest_cols = ['fall_armyworm', 'ear_rot', 'stem_borer', 'corn_earworm', 'locust']
-models = {pest: joblib.load(f"saved_models/{pest}_model.pkl") for pest in pest_cols}
-
-# Set page config
+# -------------------- CONFIG --------------------
 st.set_page_config(page_title="🌽 Maize Pest Predictor", layout="wide")
-st.title("🌾 Maize Pest and Disease Invasion Predictor")
-st.write("Use weather data to predict pest invasion levels and help farmers make informed pest control decisions.")
 
-API_KEY = "8169413357cba4f829589924f1b1742c"
+model = joblib.load("pest_severity_model.pkl")
+feature_names = joblib.load("feature_names.pkl")
+severity_map = {1: "Low", 2: "Medium", 3: "High", 4: "Very High"}
+API_KEY = "091fd5c1ab03ae28846c1748ea358f97"  # Replace with your own OpenWeatherMap API key
 
+# -------------------- WEATHER FETCH --------------------
 @st.cache_data
-def get_weather_by_city(city):
+def get_weather(city):
     url = f"https://api.openweathermap.org/data/2.5/weather?q={city}&appid={API_KEY}&units=metric"
     try:
         res = requests.get(url)
@@ -34,84 +28,124 @@ def get_weather_by_city(city):
                 "temp_min": data["main"]["temp_min"],
                 "rainfall": data.get("rain", {}).get("1h", 0.0),
                 "humidity": data["main"]["humidity"],
-                "wind_speed": data["wind"]["speed"]
+                "wind_speed": data["wind"]["speed"],
+                "weather": data["weather"][0]["description"].capitalize()
             }
     except:
-        pass
+        return None
     return None
 
-def predict_pest_risks(data):
-    input_features = np.array([[
-        data["temp_max"], data["temp_min"], data["rainfall"],
-        data["humidity"], data["wind_speed"],
-        data["soil_moisture"], data["ndvi"], data["altitude"]
-    ]])
-
-    severity_map = {0: "None", 1: "Low", 2: "Medium", 3: "High"}
-    results = {pest.replace("_", " ").title(): severity_map[models[pest].predict(input_features)[0]] for pest in pest_cols}
-    return results
-
-# UI
-col1, col2 = st.columns(2)
-with col1:
-    method = st.radio("Select weather input method", ["Manual Entry", "Enter City"])
-    weather = {}
-
-    if method == "Enter City":
-        city = st.text_input("Enter city name", "Nyeri")
-        if city:
-            weather = get_weather_by_city(city)
-            if weather:
-                st.success(f"Weather data for {weather['city']}")
-                st.write(weather)
+# -------------------- REGION MAPPING BY COORDINATES --------------------
+def get_region_from_coordinates(lat, lon):
+    if lat >= -4 and lat <= 4 and lon >= 33 and lon <= 42:
+        if lat < 0:
+            if lon > 38:
+                return "Coastal"
+            elif lon < 36:
+                return "Western"
             else:
-                st.error("City not found or API error.")
+                return "Nyanza"
+        elif lat >= 0 and lon < 37:
+            return "Rift Valley"
+        elif lat >= 0 and lon >= 37 and lat < 1:
+            return "Central"
+        elif lat >= 1:
+            return "Eastern"
+    return "ASAL areas"
+
+# -------------------- UI --------------------
+st.markdown("## 🌾 AI Maize Pest Severity Predictor")
+st.markdown("Predict pest severity using season, region, and crop condition — powered by AI and real-time weather.")
+
+with st.form("prediction_form"):
+    city = st.text_input("📍 Enter your county/town/city", "Nyeri")
+    season = st.selectbox("📅 Season", ["Jan–March", "Feb–April", "March–May", "Aug–Oct", "Sept–Dec", "Oct–Nov"])
+    crop_stage = st.selectbox("🌱 Crop Stage", ["Seedling", "Vegetative", "Tasseling", "Silking", "Grain filling", "Maturity"])
+    pest = st.selectbox("🦟 Pest", ["Fall Armyworm", "Corn Earworm", "Locust"])
+    condition = st.text_area("🧪 Field Condition (Trigger)", "Dry spells followed by rainfall")
+    submitted = st.form_submit_button("🔍 Predict")
+
+if submitted:
+    weather = get_weather(city)
+    if weather:
+        region = get_region_from_coordinates(weather["lat"], weather["lon"])
+
+        # Prepare input
+        input_data = {
+            f"Pest_{pest}": 1,
+            f"Season/Month_{season}": 1,
+            f"Crop Stage Affected_{crop_stage}": 1,
+            f"Location/Region_{region}": 1
+        }
+
+        # TF-IDF (pre-fitted with known phrases)
+        tfidf = TfidfVectorizer(max_features=25, stop_words='english')
+        tfidf.fit(["Dry spells followed by rainfall", "Warm dry spells", "Heavy rains", "Cross-border swarm movement"])
+        tfidf_input = tfidf.transform([condition])
+        tfidf_cols = [f"TFIDF_{w}" for w in tfidf.get_feature_names_out()]
+        tfidf_df = pd.DataFrame(tfidf_input.toarray(), columns=tfidf_cols)
+
+        # Combine all features
+        full_input = {col: input_data.get(col, 0) for col in feature_names}
+        for col in tfidf_df.columns:
+            if col in full_input:
+                full_input[col] = tfidf_df[col].values[0]
+
+        input_df = pd.DataFrame([full_input])
+        prediction = model.predict(input_df)[0]
+        severity = severity_map.get(prediction, "Unknown")
+
+        # -------------------- LAYOUT --------------------
+        top_left, top_right = st.columns(2)
+
+        with top_left:
+            st.markdown("### 📍 Location & Crop Info")
+            st.markdown(f"- **City:** {city.title()}")
+            st.markdown(f"- **Season:** {season}")
+            st.markdown(f"- **Crop Stage:** {crop_stage}")
+            st.markdown(f"- **Region (AI-detected):** {region}")
+
+        with top_right:
+            st.markdown("### 🦟 Pest Info")
+            st.markdown(f"- **Pest:** {pest}")
+            st.markdown(f"- **Trigger:** {condition if condition.strip() else 'N/A'}")
+
+        mid_left, mid_right = st.columns(2)
+
+        with mid_left:
+            st.subheader(f"🌦️ Weather in {city.title()}")
+            weather_table = pd.DataFrame({
+                "Weather": [weather["weather"]],
+                "Temp (°C)": [f'{weather["temp_min"]} – {weather["temp_max"]}'],
+                "Humidity (%)": [weather["humidity"]],
+                "Rainfall (mm)": [weather["rainfall"]],
+                "Wind (m/s)": [weather["wind_speed"]]
+            })
+            st.table(weather_table)
+
+        with mid_right:
+            st.subheader("📊 Prediction Summary")
+            result_df = pd.DataFrame({
+                "Pest": [pest],
+                "Severity": [severity],
+                "Crop Stage": [crop_stage],
+                "Season": [season],
+                "Region": [region]
+            })
+            st.table(result_df)
+
+            if severity == "Very High":
+                st.error("⚠️ Very High risk! Immediate action required.")
+            elif severity == "High":
+                st.warning("🔶 High risk. Monitor and apply IPM (Integrated Pest Management) measures.")
+            elif severity == "Medium":
+                st.info("🟡 Medium risk. Preventive action advised.")
+            else:
+                st.success("🟢 Low risk. Continue good agronomic practices.")
+
+        # Bottom map
+        st.markdown("---")
+        st.subheader("🗺️ Location Map")
+        st.map(pd.DataFrame([{"lat": weather["lat"], "lon": weather["lon"]}]))
     else:
-        weather["temp_max"] = st.number_input("🌡️ Max Temperature (°C)", 10.0, 50.0, 33.0)
-        weather["temp_min"] = st.number_input("🌡️ Min Temperature (°C)", 5.0, 40.0, 20.0)
-        weather["rainfall"] = st.number_input("🌧️ Rainfall (mm)", 0.0, 20.0, 0.5)
-        weather["humidity"] = st.number_input("💧 Humidity (%)", 10.0, 100.0, 60.0)
-        weather["wind_speed"] = st.number_input("💨 Wind Speed (m/s)", 0.1, 10.0, 2.0)
-
-    weather["soil_moisture"] = st.number_input("🌱 Soil Moisture (%)", 10.0, 50.0, 25.0)
-    weather["ndvi"] = st.number_input("🌿 NDVI (0.1–0.9)", 0.1, 0.9, 0.5)
-    weather["altitude"] = st.number_input("⛰️ Altitude (m)", 100.0, 2500.0, 1500.0)
-
-    if st.button("🔍 Predict", use_container_width=True):
-        preds = predict_pest_risks(weather)
-        with col2:
-            st.subheader("🧾 Prediction Results")
-            for pest, risk in preds.items():
-                st.markdown(f"<div style='padding:10px; background:#f0f0f0; border-radius:10px; margin:5px 0;'>🔍 <strong>{pest}:</strong> {risk}</div>", unsafe_allow_html=True)
-
-            if "High" in preds.values():
-                st.markdown("""
-                    ### 🚨 High Risk Detected
-                    Farmers should:
-                    - Apply **preventive treatment**
-                    - **Scout** regularly
-                    - Use traps and monitor frequently
-                """)
-
-# Show map if weather has location info
-if method == "Enter City" and weather.get("lat") and weather.get("lon"):
-    st.subheader("🗺️ Maize Pest Risk Map")
-    st.pydeck_chart(pdk.Deck(
-        map_style="mapbox://styles/mapbox/light-v9",
-        initial_view_state=pdk.ViewState(
-            latitude=weather["lat"],
-            longitude=weather["lon"],
-            zoom=6,
-            pitch=40,
-        ),
-        layers=[
-            pdk.Layer(
-                "ScatterplotLayer",
-                data=[{"position": [weather["lon"], weather["lat"]], "size": 200}],
-                get_position="position",
-                get_radius=20000,
-                get_color=[255, 0, 0],
-                pickable=True,
-            )
-        ]
-    ))
+        st.warning("🌐 Could not fetch weather. Check city spelling or internet connection.")
